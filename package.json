@@ -1,5 +1,5 @@
 {
-  "name": "luxury-jewelry-website-bd",
+  "name": "dami-meridian-be",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -8,7 +8,7 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "DAMI MERIDIAN backend - fashion, fragrance and lifestyle e-commerce API",
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.10.0",
