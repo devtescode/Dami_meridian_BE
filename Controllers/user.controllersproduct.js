@@ -137,6 +137,30 @@ module.exports.getallproducts = async (req, res) => {
     }
 }
 
+module.exports.getproductbyid = async (req, res) => {
+    try {
+        // A malformed id would blow up inside the query with a CastError;
+        // check it up front so the client gets a proper 400.
+        if (!mongoose.isValidObjectId(req.params.id)) {
+            return res.status(400).json({ message: "Invalid product id." });
+        }
+
+        const product = await Product.findById(req.params.id);
+        if (!product) {
+            return res.status(404).json({ message: "Product not found" });
+        }
+
+        res.json(product);
+    } catch (err) {
+        const clientError = clientErrorFor(err);
+        if (clientError) {
+            return res.status(clientError.status).json({ message: clientError.message });
+        }
+        console.error("Error fetching product:", err);
+        res.status(500).json({ message: "Error fetching product" });
+    }
+}
+
 module.exports.addproducts = async (req, res) => {
     // `req.body` is undefined when the request carries no body at all
     // (body-parser 2.x leaves it undefined) — never dereference it blindly.
