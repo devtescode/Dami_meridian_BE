@@ -58,4 +58,16 @@ const productSchema = new mongoose.Schema(
   }
 );
 
+/**
+ * Index on the creation timestamp.
+ *
+ * `timestamps: true` adds `createdAt` implicitly, so the path cannot be
+ * marked with `index: true` inside the field definition — it has to be
+ * declared here. The public catalogue is always served newest-first
+ * (`sort({ createdAt: -1, _id: -1 })`), so without this index every request
+ * triggers a collection scan plus an in-memory sort. It is purely additive:
+ * no document shape changes and the API contract is untouched.
+ */
+productSchema.index({ createdAt: -1 });
+
 module.exports = mongoose.model("Product", productSchema);

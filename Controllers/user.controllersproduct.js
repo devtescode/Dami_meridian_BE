@@ -1,8 +1,4 @@
    
-
-
-
-
 const jwt = require("jsonwebtoken")
 const env = require("dotenv")
 const mongoose = require("mongoose")
@@ -127,10 +123,171 @@ module.exports.userwelcome = async (req, res) => {
     res.status(200).json({ message: "Welcome to DAMI MERIDIAN" })
 }
 
+/**
+ * GET /jewelry/getallproducts — public product listing.
+ *
+ * Backward-compatible contract:
+ *  - LEGACY MODE (no `page`/`limit` in the query string): responds with a
+ *    bare JSON array sorted newest-first. The admin dashboard, the admin
+ *    products page and the product-details page all call the endpoint this
+ *    way and must keep receiving an array. `q`, `collection` and `sort`
+ *    are deliberately IGNORED here so an old consumer can never see a
+ *    filtered or reordered list by accident.
+ *  - PAGINATED MODE (`page` and/or `limit` present): responds with an object:
+ *      { products, total, page, limit, totalPages, hasNextPage, hasPrevPage }
+ *    `total` matches the filter (it is counted BEFORE slicing), and `page`
+ *    is the EFFECTIVE page after clamping to `totalPages`, so a request for
+ *    a page past the end still returns the last page instead of nothing.
+ *
+ * Paginated validation (all answered with 400 + a `message`):
+ *  - `page`: integer ≥ 1 (default 1).
+ *  - `limit`: integer ≥ 1, silently capped at 60 (default 6).
+ *  - `sort`: `newest` (default) | `price-asc` | `price-desc` | `name-asc`.
+ *  - `collection`: one of PRODUCT_COLLECTIONS; `jewellery` also matches
+ *    pre-rebrand documents stored without a `collection` field.
+ *  - `q`: trimmed, truncated to 80 chars, regex-escaped; case-insensitive
+ *    match against name or description.
+ */
 module.exports.getallproducts = async (req, res) => {
     try {
-        const products = await Product.find().sort({ createdAt: -1 });
-        res.json(products);
+        // Mode selection: the legacy consumers send no query params at all,
+        // so the mere presence of `page`/`limit` opts into the new shape.
+        const wantsPagination =
+            req.query.page !== undefined || req.query.limit !== undefined;
+
+        if (!wantsPagination) {
+            // `_id` tiebreak keeps ordering stable for documents sharing a
+            // `createdAt` — a safe, backward-compatible improvement.
+            const products = await Product.find().sort({ createdAt: -1, _id: -1 });
+            return res.json(products);
+        }
+
+        // ---- Parameter validation (before anything reaches the database) ----
+
+        // Strict digit check: accepts "2" (Express gives us strings) but
+        // rejects 0, negatives, decimals ("2.5") and garbage ("abc").
+        const isPositiveInt = (value) => /^[1-9]\d*$/.test(String(value));
+
+        const DEFAULT_PAGE = 1;
+        const DEFAULT_LIMIT = 6;
+        const MAX_LIMIT = 60;
+        const MAX_QUERY_LENGTH = 80;
+
+        let page = DEFAULT_PAGE;
+        if (req.query.page !== undefined) {
+            if (!isPositiveInt(req.query.page)) {
+                return res.status(400).json({ message: "page must be a positive integer." });
+            }
+            page = Number(req.query.page);
+        }
+
+        let limit = DEFAULT_LIMIT;
+        if (req.query.limit !== undefined) {
+            if (!isPositiveInt(req.query.limit)) {
+                return res.status(400).json({ message: "limit must be a positive integer." });
+            }
+            // Silent cap: an over-eager client gets the maximum page size
+            // rather than an error.
+            limit = Math.min(Number(req.query.limit), MAX_LIMIT);
+        }
+
+        const SORT_SPECS = {
+            "newest": { createdAt: -1, _id: -1 },
+            "price-asc": { price: 1, _id: 1 },
+            "price-desc": { price: -1, _id: 1 },
+            "name-asc": { name: 1, _id: 1 },
+        };
+        let sortSpec = SORT_SPECS.newest;
+        if (req.query.sort !== undefined && String(req.query.sort).trim() !== "") {
+            const sortKey = String(req.query.sort).trim();
+            if (!Object.prototype.hasOwnProperty.call(SORT_SPECS, sortKey)) {
+                return res.status(400).json({
+                    message: `sort must be one of: ${Object.keys(SORT_SPECS).join(", ")}.`,
+                });
+            }
+            sortSpec = SORT_SPECS[sortKey];
+        }
+
+        // ---- Filtering (built before counting so `total` stays correct) ----
+        const filters = [];
+
+        if (req.query.collection !== undefined && String(req.query.collection).trim() !== "") {
+            const collection = String(req.query.collection).trim();
+            if (!PRODUCT_COLLECTIONS.includes(collection)) {
+                return res.status(400).json({
+                    message: `collection must be one of: ${PRODUCT_COLLECTIONS.join(", ")}.`,
+                });
+            }
+            if (collection === DEFAULT_COLLECTION) {
+                // Pre-rebrand documents were stored WITHOUT a `collection`
+                // field — the schema only applies the "jewellery" default
+                // on read — so filtering on the literal value alone would
+                // hide the original product line. Match those legacy docs
+                // alongside explicitly-tagged jewellery products.
+                filters.push({
+                    $or: [
+                        { collection: DEFAULT_COLLECTION },
+                        { collection: { $exists: false } },
+                        { collection: null },
+                        { collection: "" },
+                    ],
+                });
+            } else {
+                filters.push({ collection });
+            }
+        }
+
+        if (typeof req.query.q === "string") {
+            // Truncate instead of rejecting: a too-long search term is a
+            // harmless client quirk, not an error.
+            const q = req.query.q.trim().slice(0, MAX_QUERY_LENGTH);
+            if (q) {
+                // Escape regex metacharacters so searching for "[", ".*" or
+                // "a+b" cannot crash the query (unbalanced "[" throws inside
+                // Mongo) or silently match everything.
+                const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const regex = new RegExp(escaped, "i");
+                filters.push({ $or: [{ name: regex }, { description: regex }] });
+            }
+        }
+
+        // Combined with $and, not spread at the top level: the collection
+        // filter for "jewellery" is itself an $or, and two top-level $or
+        // keys would clobber each other (an object can only hold one).
+        const filter = filters.length > 0 ? { $and: filters } : {};
+
+        // ---- Execution ----
+        const skipFor = (p) => (p - 1) * limit;
+
+        // Count and fetch in parallel; the fetch uses the requested page.
+        // Should that page turn out to be past the end, we clamp and
+        // re-fetch the last page (only for out-of-range requests), so a
+        // caller never receives an empty `products` array while data exists.
+        const [total, requestedProducts] = await Promise.all([
+            Product.countDocuments(filter),
+            Product.find(filter).sort(sortSpec).skip(skipFor(page)).limit(limit).lean(),
+        ]);
+
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+        const effectivePage = Math.min(page, totalPages);
+        const products =
+            effectivePage === page
+                ? requestedProducts
+                : await Product.find(filter)
+                      .sort(sortSpec)
+                      .skip(skipFor(effectivePage))
+                      .limit(limit)
+                      .lean();
+
+        return res.json({
+            products,
+            total,
+            page: effectivePage,
+            limit,
+            totalPages,
+            hasNextPage: effectivePage < totalPages,
+            hasPrevPage: effectivePage > 1,
+        });
     } catch (err) {
         console.error("Error fetching products:", err);
         res.status(500).json({ message: "Error fetching products" });
